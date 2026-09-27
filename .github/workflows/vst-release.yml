@@ -1,0 +1,26 @@
+name: VST release (draft)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version, e.g. 0.1.0
+        required: true
+      dry_run:
+        description: Build only (zip + skin previews as run artifacts), no draft release
+        type: boolean
+        default: true
+
+jobs:
+  euclidier:
+    uses: sd88me/mpc-vst-plugins/.github/workflows/vst-release.yml@9e56aa2a70f6731afe6800809da5a38ddc62630d
+    permissions:
+      contents: write
+    with:
+      tag: euclidier-vst-v${{ inputs.version }}
+      version: ${{ inputs.version }}
+      tools_ref: 9e56aa2a70f6731afe6800809da5a38ddc62630d
+      vst_dir: vst
+      build: vst/build.sh
+      about: 8-lane Euclidean MIDI note/CC sequencer for MPC OS, sending to other tracks via its own ALSA MIDI port.
+      dry_run: ${{ inputs.dry_run }}
