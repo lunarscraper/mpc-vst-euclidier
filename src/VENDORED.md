@@ -7,10 +7,11 @@ Source: `sd88me/force-euclidier` (fork of `intelliriffer/EUCLIDIER-CONSOLE`), re
 Vendored at commit: `1268b0e1f0f55e963c754891d94cc0055bee4cb1` (2026-09-25).
 License: MIT (same author, same license as this repo — see `LICENSE`).
 
-The VST port (`vst/`) doesn't link this engine in-process -- `euclidier_vst.cpp` spawns the
-already-deployed standalone `euclidier` binary on the device and drives it over its Unix control
-socket + its own ALSA seq virtual MIDI ports (it's a monolithic standalone app, not a library).
-These sources are vendored here only so `vst/build.sh` can build an x86 copy of the real engine for
-`host_test`'s offline ASan run, without a docker mount of the force-euclidier repo. Not modified
-from the source commit above; re-vendor by diffing against force-euclidier's repo root at a newer
-commit and copying the same files over.
+The VST port (`vst/`) compiles this engine IN-PROCESS: `vst/build.sh` copies `euclidier.cpp`,
+`eqseq.*`, `bjlund.*` and `commontypes.h` into `vst/build/eng/` next to `vst/rtmidi_stub/RtMidi.h`, so
+the engine's `#include "RtMidi.h"` resolves to that stub (no real ports, `RtMidi.cpp` isn't built), and
+`vst/euclidier_vst.cpp` `#include`s `euclidier.cpp` with its `main()` renamed, calling the engine's own
+`handleMidi()`, `processQ()`, `SQ[i].clock()` and control-socket `ctrlGet()`/`ctrlSet()` directly.
+Not modified from the source commit above; re-vendor by diffing against force-euclidier's repo root at a
+newer commit and copying the same files over. (Earlier versions of the port spawned the deployed
+standalone binary from a hard-coded /media/662522/AddOns path instead.)
