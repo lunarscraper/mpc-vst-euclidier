@@ -1,11 +1,15 @@
+# Build Euclidier into a DRAFT release (euclidier-vst-v<version>) with mpc-vst-plugins' shared workflow:
+# Actions -> "VST release (draft)" -> Run workflow. dry_run (default on) builds the zip and skin
+# previews as run artifacts only. tools_ref pinned to the same mpc-vst-plugins commit as mpc-vst-acid.
 name: VST release (draft)
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: Version, e.g. 0.1.0
+        description: Version, e.g. 1.1.0
         required: true
+        default: 1.1.0
       dry_run:
         description: Build only (zip + skin previews as run artifacts), no draft release
         type: boolean
@@ -13,14 +17,17 @@ on:
 
 jobs:
   euclidier:
-    uses: sd88me/mpc-vst-plugins/.github/workflows/vst-release.yml@9e56aa2a70f6731afe6800809da5a38ddc62630d
+    uses: sd88me/mpc-vst-plugins/.github/workflows/vst-release.yml@259f75d0ce0f836cfd89cc0a33c550b55917cffc
     permissions:
       contents: write
     with:
       tag: euclidier-vst-v${{ inputs.version }}
       version: ${{ inputs.version }}
-      tools_ref: 9e56aa2a70f6731afe6800809da5a38ddc62630d
+      tools_ref: 259f75d0ce0f836cfd89cc0a33c550b55917cffc
       vst_dir: vst
       build: vst/build.sh
-      about: 8-lane Euclidean MIDI note/CC sequencer for MPC OS, sending to other tracks via its own ALSA MIDI port.
+      host_test: vst/test.sh
+      plugin_id: euclidier
+      license: MIT
+      about: 8-lane Euclidean MIDI note/CC sequencer that drives other tracks over MIDI.
       dry_run: ${{ inputs.dry_run }}
