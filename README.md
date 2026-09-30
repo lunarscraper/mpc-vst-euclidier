@@ -8,3 +8,4 @@ sources (see `src/VENDORED.md`) so `vst/build.sh`'s offline host_test build is s
 
 Build/deploy workflow: see `sd88me/mpc-vst-plugins`' `docs/PORTING.md` and
 `.claude/skills/mpc-vst-plugin/SKILL.md`.
+Entwickelt mit Unterstützung von Claude (Anthropic)
