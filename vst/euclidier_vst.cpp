@@ -32,6 +32,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <string>
 #include <vector>
 #include <dlfcn.h>
@@ -105,6 +106,73 @@ enum { effFlagsCanReplacing = 1 << 4, effFlagsProgramChunks = 1 << 5, effFlagsIs
 static FILE *g_log;
 #define LOG(...) do { if (g_log) { std::fprintf(g_log, __VA_ARGS__); std::fflush(g_log); } } while (0)
 
+/* ---------------------------------------------------------------------------
+ * PpqClock: host ppqPos -> 24-PPQN pulses by ABSOLUTE pulse index.
+ *
+ * The first version fed "every pulse inside this block's own window
+ * [ppqPos, ppqPos + block length)". That is only exact-once if every callback's
+ * ppqPos advances by precisely frames*tempo/60/sr. When it doesn't (host splits
+ * or repeats a block, reports ppqPos late, re-derives it on a tempo change,
+ * restarts without dropping the playing flag) windows overlap or leave holes:
+ * pulses get fed twice or never, and since both engines COUNT pulses, every
+ * such pulse shifts the pattern against the MPC grid for good -> audible as an
+ * unstable tempo.
+ *
+ * Here pulse N simply IS ppq N/24. We remember the last index fed and feed
+ * (sent, last-in-this-block]: an overlap feeds nothing twice, a small hole is
+ * caught up at once, and a real jump (loop, locate, restart) is detected and
+ * re-anchored instead of silently drifting.
+ * ------------------------------------------------------------------------- */
+struct PpqClock {
+    long long sent = 0;        /* absolute index of the last pulse fed */
+    bool resync = true;        /* next block re-anchors (transport start) */
+    bool wait = false;         /* phase_mod only: holding until the old phase comes round again */
+    int phase = 0;
+    long pulses = 0, gaps = 0, dups = 0, jumps = 0;   /* diagnostics */
+};
+static const long long PPQ_JUMP_TOL = 12;   /* pulses (half a beat): beyond this it's a locate, not jitter */
+static inline long long ppq_mod(long long a, long long m) { long long r = a % m; return r < 0 ? r + m : r; }
+
+/* One audio block. Returns true and sets [*from, *to] (inclusive pulse indices) if pulses are due.
+ * phase_mod 0: caller can place the engine at any index (Euclidier sets its tick = index).
+ * phase_mod N: the engine only counts pulses (Acid, 6 per step, 12 per swing pair); after a jump
+ *              that isn't a multiple of N, hold until the index is back in the old phase, so the
+ *              pattern carries on ON the MPC grid instead of beside it. */
+static inline bool ppq_clock_block(PpqClock *c, double ppq, double tempo, double sr, int frames,
+                                   int phase_mod, long long *from, long long *to, bool *jumped) {
+    double end = ppq + frames * (tempo / 60.0) / sr;
+    long long first = (long long)std::ceil(ppq * 24.0 - 1e-6);       /* first pulse at/after block start */
+    long long last = (long long)std::ceil(end * 24.0 - 1e-6) - 1;    /* last pulse before block end */
+    *jumped = false;
+    if (c->resync) {
+        c->sent = first - 1; c->resync = false; c->wait = false;
+    } else if (!c->wait && (first > c->sent + 1 + PPQ_JUMP_TOL || last < c->sent - PPQ_JUMP_TOL)) {
+        *jumped = true; c->jumps++;
+        if (phase_mod > 0 && ppq_mod(first - (c->sent + 1), phase_mod) != 0) {
+            c->wait = true; c->phase = (int)ppq_mod(c->sent + 1, phase_mod);
+        } else c->sent = first - 1;
+    }
+    if (c->wait) {
+        long long k = first + ppq_mod(c->phase - first, phase_mod);   /* next index in the old phase */
+        if (k > last) return false;
+        c->sent = k - 1; c->wait = false;
+    }
+    if (first > c->sent + 1) c->gaps += first - (c->sent + 1);                       /* hole: caught up now */
+    else if (first <= c->sent) c->dups += (last < c->sent ? last : c->sent) - first + 1;   /* overlap: not fed twice */
+    if (last <= c->sent) return false;
+    *from = c->sent + 1; *to = last;
+    c->pulses += last - c->sent;
+    c->sent = last;
+    return true;
+}
+
+#define BUILD_ID "clockfix-2026-10-03"
+static double now_ms() {
+    timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+}
+
 /* ---- per-instance state ----------------------------------------------------- */
 struct Plugin {
     AEffect fx;
@@ -115,6 +183,11 @@ struct Plugin {
     float open[NPARAMS] = {0};             /* popup "open" flags (popup.h): wrapper-only */
     float sr = 44100.0f;
     bool was_playing = false;
+    PpqClock clk;
+    int jump_logs = 0;
+    long blocks = 0;                       /* diagnostics, logged every 5 s */
+    int32_t block_min = 1 << 30, block_max = 0;
+    double t_last_log = 0, last_ppq = 0, last_tempo = 0;
     bool refresh = false;                  /* re-read every value after the next processQ() */
     uint8_t inq[64][3];
     int in_n = 0;
@@ -243,19 +316,34 @@ static void processReplacing(AEffect *e, float **in, float **out, int32_t n) {
         }
         w->in_n = 0;
 
-        if (playing && !w->was_playing) feed(0xFA);
+        if (playing && !w->was_playing) { feed(0xFA); w->clk.resync = true; }
         else if (!playing && w->was_playing) feed(0xFC);
         w->was_playing = playing;
 
         if (playing && (ti->flags & kVstPpqPosValid) && ti->tempo > 0) {
-            const double step = 1.0 / 24.0;       /* [start, end): a boundary pulse counts once */
-            double start = ti->ppqPos, end = start + n * (ti->tempo / 60.0) / w->sr;
-            for (double next = std::ceil(start / step - 1e-9) * step; next < end - 1e-9; next += step) {
+            /* Pulses by absolute index (PpqClock above). The engine's step position is a pure
+             * function of its tick count, so tick is SET to the host's pulse index before every
+             * pulse: the lanes sit on the MPC grid by construction, also after a loop, a locate,
+             * a restart or a tempo change -- nothing left to drift. */
+            double sr = (ti->sampleRate > 0) ? ti->sampleRate : (double)w->sr;
+            long long from = 0, to = -1, before = w->clk.sent;
+            bool jumped = false;
+            bool due = ppq_clock_block(&w->clk, ti->ppqPos, ti->tempo, sr, n, 0, &from, &to, &jumped);
+            if (jumped && w->jump_logs < 20) {
+                w->jump_logs++;
+                LOG("[euclidier_vst] ppq jump: last pulse %lld -> ppq %.4f (pulse %.2f), bpm %.2f, block %d\n",
+                    before, ti->ppqPos, ti->ppqPos * 24.0, ti->tempo, n);
+            }
+            /* the engine estimates BPM from pulse spacing; block-quantised pulses make that
+             * meaningless, so the host tempo overrides it (drives gate length) */
+            if (tempo > 0) { BPM = (float)tempo; updateBPM(BPM); }
+            for (long long idx = from; due && idx <= to; idx++) {
+                if (idx < 0) continue;            /* pre-roll before bar 1 */
+                tick = idx;
                 feed(0xF8);
-                /* the engine estimates BPM from pulse spacing; block-quantised pulses make that
-                 * jittery, so the host tempo overrides it (drives gate length) */
                 if (tempo > 0) { BPM = (float)tempo; updateBPM(BPM); }
             }
+            w->last_ppq = ti->ppqPos; w->last_tempo = ti->tempo;
         }
 
         long long us = getUS();
@@ -266,6 +354,20 @@ static void processReplacing(AEffect *e, float **in, float **out, int32_t n) {
             for (int i = 0; i < SEQS; i++) SQ[i].clock(us);   /* note-offs */
 
         if (w->refresh) { refresh_cache(w); w->refresh = false; update_display = true; }
+    }
+    w->blocks++;
+    if (n < w->block_min) w->block_min = n;
+    if (n > w->block_max) w->block_max = n;
+    double t1 = now_ms();
+    if (t1 - w->t_last_log > 5000.0) {
+        if (w->t_last_log > 0)
+            LOG("[euclidier_vst] %ld blocks, size %d..%d, playing %d, ppq %.3f, bpm %.2f"
+                " | clock: %ld pulses, %ld caught up, %ld overlapped, %ld jumps\n",
+                w->blocks, w->block_min, w->block_max, (int)w->was_playing, w->last_ppq, w->last_tempo,
+                w->clk.pulses, w->clk.gaps, w->clk.dups, w->clk.jumps);
+        w->clk.pulses = w->clk.gaps = w->clk.dups = w->clk.jumps = 0;
+        w->jump_logs = 0;
+        w->t_last_log = t1; w->blocks = 0; w->block_min = 1 << 30; w->block_max = 0;
     }
     for (int i = 0; i < NPARAMS; i++)
         if (w->release[i]) { w->release[i] = 0; w->master(&w->fx, audioMasterAutomate, i, 0, 0, 0.0f); }
@@ -438,6 +540,6 @@ extern "C" __attribute__((visibility("default"))) AEffect *VSTPluginMain(audioMa
     e->uniqueID = PLUG_UID;
     e->version = PLUG_VERSION;
     e->object = w;
-    LOG("[euclidier_vst] up, %d params, owner=%d\n", NPARAMS, (int)w->owner);
+    LOG("[euclidier_vst] up (" BUILD_ID "), %d params, owner=%d\n", NPARAMS, (int)w->owner);
     return e;
 }
