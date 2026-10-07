@@ -1,6 +1,8 @@
 /* Offline x86 test of euclidier_vst.cpp with the engine linked in-process (built
  * -DNO_ALSA by build.sh): parameter round-trip, popup, second instance stays inert,
- * synthesised transport -> notes, stop -> no hanging notes, chunk restore. PASSED/FAILED. */
+ * synthesised transport -> notes, stop -> no hanging notes, chunk restore. PASSED/FAILED.
+ * The effect variant (Euclidier FX, numInputs == 2) gets an input signal and must pass it
+ * through bit-exact, separate buffers and in-place. */
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -28,6 +30,9 @@ struct AEffect {
     void (*processDoubleReplacing)(AEffect *, double **, double **, int32_t);
     char future[56];
 };
+typedef struct { int32_t type, byteSize, deltaFrames, flags, noteLength, noteOffset; unsigned char midiData[4];
+                 char detune, noteOffVelocity, reserved1, reserved2; } VstMidiEvent;
+typedef struct { int32_t numEvents; intptr_t reserved; void *events[2]; } VstEvents;
 typedef struct {
     double samplePos, sampleRate, nanoSeconds, ppqPos, tempo, barStartPos, cycleStartPos, cycleEndPos;
     int32_t timeSigNumerator, timeSigDenominator, smpteOffset, smpteFrameRate, samplesToNextClock, flags;
@@ -48,19 +53,22 @@ static std::string disp(AEffect *e, int i) { char b[64] = {0}; e->dispatcher(e, 
 /* real-time-ish run: the engine times note-offs by wall clock, so blocks are paced */
 static std::string play(AEffect *e, int blocks, bool stop_at_end = true) {
     float l[128], r[128]; float *o[2] = {l, r};
+    float il[128], ir[128]; float *iv[2] = {il, ir};
+    for (int i = 0; i < 128; i++) { il[i] = 0.25f; ir[i] = -0.5f; }
+    float **in = e->numInputs ? iv : nullptr;
     fflush(stdout);
     char *buf = nullptr; size_t len = 0;
     FILE *mem = open_memstream(&buf, &len);
     FILE *old = stdout; stdout = mem;
     ti.flags = (1 << 1) | (1 << 9) | (1 << 10); ti.tempo = 120; ti.ppqPos = 0;
     for (int b = 0; b < blocks; b++) {
-        e->processReplacing(e, nullptr, o, 128);
+        e->processReplacing(e, in, o, 128);
         ti.ppqPos += 128 * (120.0 / 60.0) / 44100.0;
         usleep(2902);
     }
     if (stop_at_end) {
         ti.flags = (1 << 9) | (1 << 10);
-        for (int b = 0; b < 40; b++) { e->processReplacing(e, nullptr, o, 128); usleep(2902); }
+        for (int b = 0; b < 40; b++) { e->processReplacing(e, in, o, 128); usleep(2902); }
     }
     fflush(mem); stdout = old; fclose(mem);
     std::string s(buf, len); free(buf);
@@ -87,7 +95,28 @@ int main(int argc, char **argv) {
     auto entry = (AEffect *(*)(audioMasterCallback))dlsym(h, "VSTPluginMain");
     AEffect *a = entry(master), *b = entry(master);
     CHECK(a && b && a->magic == 0x56737450, "instances");
-    std::printf("params: %d\n", a->numParams);
+    std::printf("params: %d, inputs: %d, flags: 0x%x, category: %d\n", a->numParams, a->numInputs, a->flags,
+                (int)a->dispatcher(a, 35, 0, 0, nullptr, 0));
+    {   /* audio path: instrument writes silence, effect passes the input through */
+        float il[128], ir[128], ol[128], orr[128];
+        for (int i = 0; i < 128; i++) { il[i] = i / 128.0f; ir[i] = -i / 256.0f; ol[i] = orr[i] = 9.0f; }
+        float *iv[2] = {il, ir}, *ov[2] = {ol, orr};
+        a->processReplacing(a, a->numInputs ? iv : nullptr, ov, 128);
+        if (a->numInputs) {
+            CHECK(a->numInputs == 2 && !(a->flags & (1 << 8)) && a->dispatcher(a, 35, 0, 0, nullptr, 0) == 1,
+                  "effect: 2 inputs, not a synth, category Effect");
+            CHECK(!std::memcmp(il, ol, sizeof il) && !std::memcmp(ir, orr, sizeof ir), "effect passes audio through");
+            float keep[128]; std::memcpy(keep, il, sizeof il);
+            a->processReplacing(a, iv, iv, 128);                 /* in-place, as hosts do for inserts */
+            CHECK(!std::memcmp(keep, il, sizeof il), "effect in-place pass-through");
+            for (int i = 0; i < 128; i++) ol[i] = orr[i] = 9.0f;
+            a->processReplacing(a, nullptr, ov, 128);            /* no input buffers: silence, no crash */
+            CHECK(ol[5] == 0.0f && orr[5] == 0.0f, "effect without input writes silence");
+        } else {
+            CHECK((a->flags & (1 << 8)) && a->dispatcher(a, 35, 0, 0, nullptr, 0) == 2, "instrument: synth flag, category Synth");
+            CHECK(ol[5] == 0.0f && orr[5] == 0.0f, "instrument writes silence");
+        }
+    }
 
     int en1 = find(a, "Enable", 0), steps1 = find(a, "Steps", 0), fill1 = find(a, "Fill", 0),
         div1 = find(a, "Div", 0), divlist1 = find(a, "Div List", 0), en2 = find(a, "Enable", 1);
@@ -121,13 +150,52 @@ int main(int argc, char **argv) {
     play(a, 60);
     CHECK(disp(a, fill1) == "5", "preset load restores fill: %s", disp(a, fill1).c_str());
 
+    {   /* control by MIDI CC: lane 1 fill = CC 12, on the Control Ch (default 16) only */
+        int cch = find(a, "Control Ch");
+        CHECK(cch >= 0 && disp(a, cch) == "16", "control channel default 16: %s", cch >= 0 ? disp(a, cch).c_str() : "missing");
+        auto cc = [&](int ch, int num, int val) {
+            VstMidiEvent m; std::memset(&m, 0, sizeof m);
+            m.type = 1; m.byteSize = sizeof m;
+            m.midiData[0] = (unsigned char)(0xB0 | (ch - 1)); m.midiData[1] = (unsigned char)num; m.midiData[2] = (unsigned char)val;
+            VstEvents ev; ev.numEvents = 1; ev.reserved = 0; ev.events[0] = &m; ev.events[1] = nullptr;
+            a->dispatcher(a, 25, 0, 0, &ev, 0);
+            float l[128], r[128], il[128] = {0}, ir[128] = {0}; float *o[2] = {l, r}, *iv[2] = {il, ir};
+            ti.flags = (1 << 9) | (1 << 10);
+            for (int b = 0; b < 3; b++) a->processReplacing(a, a->numInputs ? iv : nullptr, o, 128);
+        };
+        cc(16, 12, 64);
+        CHECK(disp(a, fill1) == "33", "CC 12 on ch 16 sets lane 1 fill: %s", disp(a, fill1).c_str());
+        cc(1, 12, 0);
+        CHECK(disp(a, fill1) == "33", "CC on another channel is ignored: %s", disp(a, fill1).c_str());
+        cc(16, 11, 127);
+        CHECK(disp(a, steps1) == "64", "CC 11 sets lane 1 steps: %s", disp(a, steps1).c_str());
+        cc(16, 20, 0);
+        CHECK(disp(a, en2) == "OFF", "CC 20 switches lane 2 off: %s", disp(a, en2).c_str());
+        a->setParameter(a, cch, 3.0f / 16.0f);
+        CHECK(disp(a, cch) == "3", "control channel 3: %s", disp(a, cch).c_str());
+        cc(16, 12, 0);
+        CHECK(disp(a, fill1) == "33", "old channel ignored after change: %s", disp(a, fill1).c_str());
+        cc(3, 12, 0);
+        CHECK(disp(a, fill1) == "1", "new channel works: %s", disp(a, fill1).c_str());
+        a->setParameter(a, cch, 0.0f);
+        cc(3, 12, 127); cc(1, 12, 127);
+        CHECK(disp(a, cch) == "OFF" && disp(a, fill1) == "1", "OFF ignores every CC: %s", disp(a, fill1).c_str());
+        a->setParameter(a, cch, 3.0f / 16.0f);
+        a->setParameter(a, fill1, (5 - 1) / 63.0f);
+        a->setParameter(a, steps1, (16 - 2) / 62.0f);
+    }
+
     void *ck = nullptr;
     intptr_t n = a->dispatcher(a, 23, 0, 0, &ck, 0);
     CHECK(n > 100 && ck && std::strstr((char *)ck, "l1_fill=5;"), "chunk contains fill");
+    CHECK(ck && std::strstr((char *)ck, "cc_ch=3;"), "chunk contains the control channel");
+    int cch2 = find(a, "Control Ch");
     std::string chunk((char *)ck, n);
     a->setParameter(a, fill1, 1.0f);
+    a->setParameter(a, cch2, 1.0f);
     a->dispatcher(a, 24, 0, n, (void *)chunk.data(), 0);
     CHECK(disp(a, fill1) == "5", "chunk restore fill %s", disp(a, fill1).c_str());
+    CHECK(disp(a, cch2) == "3", "chunk restore control channel %s", disp(a, cch2).c_str());
 
     b->dispatcher(b, 1, 0, 0, nullptr, 0);
     a->dispatcher(a, 1, 0, 0, nullptr, 0);

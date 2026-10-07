@@ -26,6 +26,22 @@
  * (it was written as a one-instance app), so ONE instance per project drives it; a
  * second instance loads but stays silent (logged to /tmp/euclidier_vst.log).
  * Every engine call happens under the engine's own engineMutex.
+ *
+ * TWO VARIANTS from this one file (params.h decides, see ../vst-fx/vst.json "effect": true):
+ *   Euclidier     instrument (IsSynth, 0 in / 2 out, writes silence) -> uses one of the 8 plugin
+ *                 instrument slots of MPC/Force
+ *   Euclidier FX  insert effect (PLUG_EFFECT: 2 in / 2 out, audio passed through untouched,
+ *                 category Effect, own UID and own ALSA port "Euclidier FX") -> uses NO instrument
+ *                 slot; put it as an insert on the track it drives, or on the master.
+ * CONTROL BY MIDI CC (both variants): the plugin has a second ALSA port "Control In" that subscribes
+ * itself to every hardware MIDI input (also ones plugged in later). CCs on the channel chosen with
+ * the "Control Ch" parameter (OFF, 1..16; default 16; saved with the project) set parameters:
+ *   CC 10*L + k for lane L = 1..8:  k = 0 enable, 1 steps, 2 fill, 3 shift, 4 loop, 5 gate,
+ *                                       6 velocity, 7 humanize, 8 note, 9 division
+ *   CC 100 preset, 101 load, 102 save, 103 rand lane, 104 randomize (buttons: value >= 64)
+ * "Control Ch" lives in this wrapper only (the engine doesn't know the key).
+ * The sequencer part is identical. Whether the host gives an insert the same transport/tempo and
+ * keeps calling it while the track is silent is logged (see "no timeinfo" in the 5 s log line).
  * ========================================================================== */
 #include <atomic>
 #include <cmath>
@@ -166,7 +182,12 @@ static inline bool ppq_clock_block(PpqClock *c, double ppq, double tempo, double
     return true;
 }
 
-#define BUILD_ID "clockfix-2026-10-03"
+#define BUILD_ID "fx-cc-2026-10-07"
+#ifdef PLUG_EFFECT
+#define PLUG_MODE "effect"
+#else
+#define PLUG_MODE "instrument"
+#endif
 static double now_ms() {
     timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -186,6 +207,8 @@ struct Plugin {
     PpqClock clk;
     int jump_logs = 0;
     long blocks = 0;                       /* diagnostics, logged every 5 s */
+    long no_ti = 0, midi_in = 0;           /* blocks without host time info / MIDI events received */
+    long cc_in = 0, cc_used = 0;           /* control CCs seen on the Control In port / applied */
     int32_t block_min = 1 << 30, block_max = 0;
     double t_last_log = 0, last_ppq = 0, last_tempo = 0;
     bool refresh = false;                  /* re-read every value after the next processQ() */
@@ -195,22 +218,58 @@ struct Plugin {
 #ifndef NO_ALSA
     snd_seq_t *seq = nullptr;
     int port = -1;
+    int ctl_port = -1;                     /* "Control In": CCs from hardware controllers */
 #endif
 };
 static Plugin *g_owner = nullptr;          /* guarded by engineMutex */
+static int g_cc_ch_idx = -1;               /* index of the wrapper-only "cc_ch" param */
 
 /* ---- MIDI out: everything the engine sends lands here (rtmidi_stub/RtMidi.h) ---- */
 #ifndef NO_ALSA
+/* Subscribe Control In to one hardware MIDI input (a USB controller, the DIN input). */
+static void ctl_subscribe(Plugin *w, int client, int port) {
+    if (client == snd_seq_client_id(w->seq) || client == SND_SEQ_CLIENT_SYSTEM) return;
+    snd_seq_port_info_t *pi;
+    snd_seq_port_info_alloca(&pi);
+    if (snd_seq_get_any_port_info(w->seq, client, port, pi) < 0) return;
+    unsigned cap = snd_seq_port_info_get_capability(pi), type = snd_seq_port_info_get_type(pi);
+    if ((cap & (SND_SEQ_PORT_CAP_READ | SND_SEQ_PORT_CAP_SUBS_READ)) != (SND_SEQ_PORT_CAP_READ | SND_SEQ_PORT_CAP_SUBS_READ)) return;
+    if (cap & SND_SEQ_PORT_CAP_NO_EXPORT) return;
+    if (!(type & SND_SEQ_PORT_TYPE_HARDWARE)) return;         /* not other plugins' virtual ports */
+    int rc = snd_seq_connect_from(w->seq, w->ctl_port, client, port);
+    LOG("[euclidier_vst] control in <- %d:%d '%s'%s\n", client, port, snd_seq_port_info_get_name(pi),
+        rc < 0 ? " (already connected or refused)" : "");
+}
+static void ctl_subscribe_all(Plugin *w) {
+    snd_seq_client_info_t *ci;
+    snd_seq_port_info_t *pi;
+    snd_seq_client_info_alloca(&ci);
+    snd_seq_port_info_alloca(&pi);
+    snd_seq_client_info_set_client(ci, -1);
+    while (snd_seq_query_next_client(w->seq, ci) >= 0) {
+        int c = snd_seq_client_info_get_client(ci);
+        snd_seq_port_info_set_client(pi, c);
+        snd_seq_port_info_set_port(pi, -1);
+        while (snd_seq_query_next_port(w->seq, pi) >= 0) ctl_subscribe(w, c, snd_seq_port_info_get_port(pi));
+    }
+}
 static void alsa_open(Plugin *w) {
-    if (snd_seq_open(&w->seq, "default", SND_SEQ_OPEN_OUTPUT, SND_SEQ_NONBLOCK) < 0) {
+    if (snd_seq_open(&w->seq, "default", SND_SEQ_OPEN_DUPLEX, SND_SEQ_NONBLOCK) < 0) {
         w->seq = nullptr; LOG("[euclidier_vst] snd_seq_open failed\n"); return;
     }
     snd_seq_set_client_pool_output(w->seq, 2048);
-    snd_seq_set_client_name(w->seq, "Euclidier");
+    snd_seq_set_client_name(w->seq, PLUG_NAME);   /* "Euclidier" / "Euclidier FX" */
     w->port = snd_seq_create_simple_port(w->seq, "MIDI Out",
         SND_SEQ_PORT_CAP_READ | SND_SEQ_PORT_CAP_SUBS_READ,
         SND_SEQ_PORT_TYPE_MIDI_GENERIC | SND_SEQ_PORT_TYPE_APPLICATION);
-    LOG("[euclidier_vst] ALSA client 'Euclidier' (%d) port %d\n", snd_seq_client_id(w->seq), w->port);
+    LOG("[euclidier_vst] ALSA client '" PLUG_NAME "' (%d) port %d\n", snd_seq_client_id(w->seq), w->port);
+    w->ctl_port = snd_seq_create_simple_port(w->seq, "Control In",
+        SND_SEQ_PORT_CAP_WRITE | SND_SEQ_PORT_CAP_SUBS_WRITE,
+        SND_SEQ_PORT_TYPE_MIDI_GENERIC | SND_SEQ_PORT_TYPE_APPLICATION);
+    if (w->ctl_port < 0) { LOG("[euclidier_vst] no Control In port\n"); return; }
+    /* hot-plug: the system announce port tells us about ports that appear later */
+    snd_seq_connect_from(w->seq, w->ctl_port, SND_SEQ_CLIENT_SYSTEM, SND_SEQ_PORT_SYSTEM_ANNOUNCE);
+    ctl_subscribe_all(w);
 }
 static void alsa_send(Plugin *w, const std::vector<unsigned char> &m) {
     if (!w || !w->seq || w->port < 0) return;
@@ -228,7 +287,23 @@ static void alsa_send(Plugin *w, const std::vector<unsigned char> &m) {
     snd_seq_event_output_direct(w->seq, &ev);
 }
 static void alsa_close(Plugin *w) { if (w->seq) snd_seq_close(w->seq); w->seq = nullptr; }
+static void apply_cc(Plugin *w, int ch, int cc, int val);
+/* audio thread, engineMutex held: drain Control In (non-blocking) */
+static void alsa_poll(Plugin *w) {
+    if (!w->seq || w->ctl_port < 0) return;
+    snd_seq_event_t *ev = nullptr;
+    for (int guard = 0; guard < 256 && snd_seq_event_input_pending(w->seq, 1) > 0; guard++) {
+        if (snd_seq_event_input(w->seq, &ev) < 0 || !ev) break;
+        if (ev->type == SND_SEQ_EVENT_CONTROLLER) {
+            w->cc_in++;
+            apply_cc(w, ev->data.control.channel, (int)ev->data.control.param, ev->data.control.value);
+        } else if (ev->type == SND_SEQ_EVENT_PORT_START) {
+            ctl_subscribe(w, ev->data.addr.client, ev->data.addr.port);
+        }
+    }
+}
 #else
+static void alsa_poll(Plugin *) {}
 /* Offline test build: EUCLIDIER_TRACE=1 prints every outgoing message. */
 static void alsa_open(Plugin *) {}
 static void alsa_send(Plugin *, const std::vector<unsigned char> &m) {
@@ -290,21 +365,65 @@ static float ui_to_norm(const param_t *p, double v) {
 static bool is_value_param(int i) { return !PARAMS[i].momentary && !popup_is(i); }
 static void refresh_cache(Plugin *w) {
     for (int i = 0; i < NPARAMS; i++) {
-        if (!is_value_param(i)) continue;
+        if (!is_value_param(i) || i == g_cc_ch_idx) continue;
         std::string r = ctrlGet(PARAMS[i].key);
         if (r != "ERR" && !r.empty()) w->cache[i].store(ui_to_norm(&PARAMS[i], std::atof(r.c_str())));
     }
+}
+
+/* ---- control by MIDI CC (see header) ---------------------------------------------- */
+static int param_index(const char *key) {
+    for (int i = 0; i < NPARAMS; i++) if (!std::strcmp(PARAMS[i].key, key)) return i;
+    return -1;
+}
+static bool cc_to_key(int cc, char *key, size_t max) {
+    static const char *const LANE[10] = {"enable", "steps", "fill", "shift", "loop", "gate", "vel", "velh", "note", "div"};
+    static const char *const GLOB[5] = {"preset", "preset_load", "preset_save", "rand_lane", "rand_go"};
+    if (cc >= 10 && cc <= 89) { std::snprintf(key, max, "l%d_%s", cc / 10, LANE[cc % 10]); return true; }
+    if (cc >= 100 && cc <= 104) { std::snprintf(key, max, "%s", GLOB[cc - 100]); return true; }
+    return false;
+}
+/* caller holds engineMutex. ch 0..15 */
+static void apply_cc(Plugin *w, int ch, int cc, int val) {
+    if (!w->owner || g_cc_ch_idx < 0) return;
+    int sel = (int)std::lround(w->cache[g_cc_ch_idx].load() * (PARAMS[g_cc_ch_idx].nopts - 1));   /* 0 = OFF */
+    if (sel == 0 || ch != sel - 1) return;
+    char key[24];
+    if (!cc_to_key(cc, key, sizeof key)) return;
+    int i = param_index(key);
+    if (i < 0) return;
+    const param_t *p = &PARAMS[i];
+    if (val < 0) val = 0;
+    if (val > 127) val = 127;
+    w->cc_used++;
+    if (p->momentary) {
+        if (val >= 64) { ctrlSet(p->key, 1); w->refresh = true; }
+        return;
+    }
+    int ui = norm_to_ui(p, val / 127.0f);
+    w->cache[i].store(ui_to_norm(p, ui));
+    ctrlSet(p->key, ui);
+    w->refresh = true;
 }
 static void feed(unsigned char b0) { std::vector<unsigned char> m = {b0}; handleMidi(&m); }
 
 /* ---- audio callback: transport -> clock, queue, note-offs ------------------------- */
 static void processReplacing(AEffect *e, float **in, float **out, int32_t n) {
-    (void)in;
     Plugin *w = (Plugin *)e->object;
+#ifdef PLUG_EFFECT
+    /* insert effect: the track's audio goes through untouched (the host may hand us in == out) */
+    for (int ch = 0; ch < 2; ch++) {
+        if (in && in[ch]) { if (out[ch] != in[ch]) std::memmove(out[ch], in[ch], (size_t)n * sizeof(float)); }
+        else std::memset(out[ch], 0, (size_t)n * sizeof(float));
+    }
+#else
+    (void)in;
     for (int32_t i = 0; i < n; i++) out[0][i] = out[1][i] = 0.0f;   /* MIDI generator: no audio */
+#endif
     if (!w->owner) return;
     VstTimeInfo *ti = (VstTimeInfo *)w->master(&w->fx, audioMasterGetTime, 0,
                                                 kVstTempoValid | kVstPpqPosValid, 0, 0);
+    if (!ti) w->no_ti++;
     bool playing = ti && (ti->flags & kVstTransportPlaying);
     double tempo = (ti && (ti->flags & kVstTempoValid) && ti->tempo > 20.0 && ti->tempo < 400.0) ? ti->tempo : 0.0;
     bool update_display = false;
@@ -313,8 +432,10 @@ static void processReplacing(AEffect *e, float **in, float **out, int32_t n) {
         for (int i = 0; i < w->in_n; i++) {        /* notes into the track: the engine's own transpose */
             uint8_t t = w->inq[i][0] & 0xF0;
             if (t == 0x90 || t == 0x80) { std::vector<unsigned char> m(w->inq[i], w->inq[i] + 3); handleMidi(&m); }
+            else if (t == 0xB0) apply_cc(w, w->inq[i][0] & 0x0F, w->inq[i][1], w->inq[i][2]);   /* CCs sent to the track */
         }
         w->in_n = 0;
+        alsa_poll(w);                               /* CCs from hardware controllers (Control In) */
 
         if (playing && !w->was_playing) { feed(0xFA); w->clk.resync = true; }
         else if (!playing && w->was_playing) feed(0xFC);
@@ -362,9 +483,11 @@ static void processReplacing(AEffect *e, float **in, float **out, int32_t n) {
     if (t1 - w->t_last_log > 5000.0) {
         if (w->t_last_log > 0)
             LOG("[euclidier_vst] %ld blocks, size %d..%d, playing %d, ppq %.3f, bpm %.2f"
-                " | clock: %ld pulses, %ld caught up, %ld overlapped, %ld jumps\n",
+                " | clock: %ld pulses, %ld caught up, %ld overlapped, %ld jumps"
+                " | no timeinfo %ld, midi in %ld | control cc %ld seen, %ld used\n",
                 w->blocks, w->block_min, w->block_max, (int)w->was_playing, w->last_ppq, w->last_tempo,
-                w->clk.pulses, w->clk.gaps, w->clk.dups, w->clk.jumps);
+                w->clk.pulses, w->clk.gaps, w->clk.dups, w->clk.jumps, w->no_ti, w->midi_in, w->cc_in, w->cc_used);
+        w->no_ti = w->midi_in = w->cc_in = w->cc_used = 0;
         w->clk.pulses = w->clk.gaps = w->clk.dups = w->clk.jumps = 0;
         w->jump_logs = 0;
         w->t_last_log = t1; w->blocks = 0; w->block_min = 1 << 30; w->block_max = 0;
@@ -399,7 +522,7 @@ static void setParameter(AEffect *e, int32_t i, float n) {
         }
     }
     w->cache[i].store(clamp01(n));
-    ctrlSet(p->key, norm_to_ui(p, n));
+    if (i != g_cc_ch_idx) ctrlSet(p->key, norm_to_ui(p, n));   /* Control Ch: wrapper only */
     w->refresh = true;
     if (!nudge) popup_picked(w->open, w->release, i);
 }
@@ -438,7 +561,7 @@ static intptr_t set_chunk(Plugin *w, const void *data, intptr_t len) {
             if (!is_value_param(i) || std::strcmp(PARAMS[i].key, tok)) continue;
             int v = std::atoi(eq + 1);
             w->cache[i].store(ui_to_norm(&PARAMS[i], v));
-            if (w->owner) ctrlSet(PARAMS[i].key, v);
+            if (w->owner && i != g_cc_ch_idx) ctrlSet(PARAMS[i].key, v);
             break;
         }
     }
@@ -467,7 +590,11 @@ static intptr_t dispatcher(AEffect *e, int32_t op, int32_t idx, intptr_t v, void
         LOG("[euclidier_vst] closed (owner=%d)\n", (int)w->owner);
         delete w;
         return 1;
-    case effGetPlugCategory: return 2;
+#ifdef PLUG_EFFECT
+    case effGetPlugCategory: return 1;   /* kPlugCategEffect */
+#else
+    case effGetPlugCategory: return 2;   /* kPlugCategSynth */
+#endif
     case effGetEffectName:
     case effGetProductString: copy_str(p, PLUG_NAME, 32); return 1;
     case effGetVendorString: copy_str(p, PLUG_VENDOR, 32); return 1;
@@ -497,6 +624,7 @@ static intptr_t dispatcher(AEffect *e, int32_t op, int32_t idx, intptr_t v, void
         std::lock_guard<std::mutex> lk(engineMutex);
         for (int i = 0; ev && i < ev->numEvents && w->in_n < 64; i++) {
             if (ev->events[i]->type != 1) continue;
+            w->midi_in++;
             std::memcpy(w->inq[w->in_n++], ((VstMidiEvent *)ev->events[i])->midiData, 3);
         }
         return 1;
@@ -517,6 +645,8 @@ extern "C" __attribute__((visibility("default"))) AEffect *VSTPluginMain(audioMa
     Plugin *w = new Plugin();
     w->master = master;
     for (int i = 0; i < NPARAMS; i++) w->cache[i].store(PARAMS[i].def);
+    g_cc_ch_idx = param_index("cc_ch");
+    if (g_cc_ch_idx >= 0) w->cache[g_cc_ch_idx].store(1.0f);   /* default: channel 16 */
     {
         std::lock_guard<std::mutex> lk(engineMutex);
         engine_init();
@@ -534,12 +664,18 @@ extern "C" __attribute__((visibility("default"))) AEffect *VSTPluginMain(audioMa
     e->getParameter = getParameter;
     e->processReplacing = processReplacing;
     e->numParams = NPARAMS;
+#ifdef PLUG_EFFECT
+    e->numInputs = 2;
+    e->numOutputs = 2;
+    e->flags = effFlagsCanReplacing | effFlagsProgramChunks;
+#else
     e->numInputs = 0;
     e->numOutputs = 2;
     e->flags = effFlagsCanReplacing | effFlagsIsSynth | effFlagsProgramChunks;
+#endif
     e->uniqueID = PLUG_UID;
     e->version = PLUG_VERSION;
     e->object = w;
-    LOG("[euclidier_vst] up (" BUILD_ID "), %d params, owner=%d\n", NPARAMS, (int)w->owner);
+    LOG("[euclidier_vst] " PLUG_NAME " up (" BUILD_ID ", " PLUG_MODE "), %d params, owner=%d\n", NPARAMS, (int)w->owner);
     return e;
 }

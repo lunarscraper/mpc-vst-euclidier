@@ -1,0 +1,11 @@
+{
+  "name": "Euclidier FX",
+  "vendor": "sd88me",
+  "uid": "EqFx",
+  "version": 1000,
+  "so": "euclidier_fx.so",
+  "effect": true,
+  "module": "../vst/module.json",
+  "layout": "../vst/layout.conf",
+  "_comment": "Insert-effect variant of ../vst (same euclidier_vst.cpp, same parameters and skin layout): 'effect' makes gen_vst.py emit PLUG_EFFECT in params.h and a category=Effect plugin-list entry, so the sequencer loads as an insert and takes none of the 8 plugin instrument slots. Audio is passed through untouched; notes go out through the plugin's own ALSA seq port 'Euclidier FX'. Own uid/so/name, so it installs next to the instrument variant."
+}

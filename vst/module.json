@@ -109,6 +109,8 @@
     { "key": "preset_load",  "name": "Load",       "access": "write" },
     { "key": "preset_save",  "name": "Save",       "access": "write" },
     { "key": "rand_lane",    "name": "Rand Lane",  "options": ["ALL", "LANE 1", "LANE 2", "LANE 3", "LANE 4", "LANE 5", "LANE 6", "LANE 7", "LANE 8", "ALL BUT 1", "ALL BUT 5"] },
-    { "key": "rand_go",      "name": "Randomize",  "access": "write" }
+    { "key": "rand_go",      "name": "Randomize",  "access": "write" },
+
+    { "key": "cc_ch",     "name": "Control Ch", "options": ["OFF", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16"] }
   ]
 }
