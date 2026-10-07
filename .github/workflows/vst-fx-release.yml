@@ -1,0 +1,33 @@
+# Build Euclidier FX (the insert-effect variant, vst-fx/) into a DRAFT release (euclidier-fx-vst-v<version>):
+# Actions -> "VST release FX (draft)" -> Run workflow. dry_run (default on) builds the zip and skin
+# previews as run artifacts only. Same pinned mpc-vst-plugins commit as vst-release.yml.
+name: VST release FX (draft)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version, e.g. 1.0.0
+        required: true
+        default: 1.0.0
+      dry_run:
+        description: Build only (zip + skin previews as run artifacts), no draft release
+        type: boolean
+        default: true
+
+jobs:
+  euclidier-fx:
+    uses: sd88me/mpc-vst-plugins/.github/workflows/vst-release.yml@259f75d0ce0f836cfd89cc0a33c550b55917cffc
+    permissions:
+      contents: write
+    with:
+      tag: euclidier-fx-vst-v${{ inputs.version }}
+      version: ${{ inputs.version }}
+      tools_ref: 259f75d0ce0f836cfd89cc0a33c550b55917cffc
+      vst_dir: vst-fx
+      build: bash vst-fx/build.sh
+      host_test: bash vst-fx/test.sh
+      plugin_id: euclidier-fx
+      license: MIT
+      about: 8-lane Euclidean MIDI note/CC sequencer as an insert effect - drives other tracks over MIDI without using a plugin instrument slot.
+      dry_run: ${{ inputs.dry_run }}
