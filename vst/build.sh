@@ -22,12 +22,14 @@ else
     gcc -O2 -I/mv/tools/vendor/force-shadow/tools -o build/shadow_art /mv/tools/shadow_art.c -lm
 fi
 
-# 2. params.h, skin, pluginlist-entry.xml (needs Pillow)
+# 2. params.h, skin, pluginlist-entry.xml (needs Pillow); captions.py then redraws the small baked
+#    bitmap labels in Titillium Web at the size of the knob names (as in mpc-vst-drumgen)
 if python3 -c "import PIL" 2>/dev/null; then
   python3 "$MPC_VST/tools/gen_vst.py" vst.json
+  python3 captions.py layout.conf "build/skin/sd88me - VST - Euclidier/Plugin Skins" fonts/TitilliumWeb-SemiBold.ttf
 else
   docker run --rm -u "$U" -v "$PWD":/w -v "$MPC_VST":/mv:ro -w /w python:3.11-slim sh -c \
-    "pip install -q --no-warn-script-location --target /tmp/p pillow >/dev/null 2>&1; PYTHONPATH=/tmp/p python3 /mv/tools/gen_vst.py vst.json"
+    "pip install -q --no-warn-script-location --target /tmp/p pillow >/dev/null 2>&1; PYTHONPATH=/tmp/p python3 /mv/tools/gen_vst.py vst.json && PYTHONPATH=/tmp/p python3 captions.py layout.conf \"build/skin/sd88me - VST - Euclidier/Plugin Skins\" fonts/TitilliumWeb-SemiBold.ttf"
 fi
 cp "$MPC_VST/wrapper/popup.h" build/   # popup open-flag handling shared with mpc-vst's own wrapper
 

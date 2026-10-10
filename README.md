@@ -29,6 +29,14 @@ Diagnose: `/tmp/euclidier_vst.log` schreibt alle 5 s eine Zeile. `playing 1` und
 Host einem Insert keine Zeitinfo liefert; bleiben die Zeilen ganz aus, hält der Host den Insert
 bei Stille an.
 
+## Beschriftungen
+
+Alle Beschriftungen im Skin (Rahmentitel, Popup- und MODE-Überschriften, Button-Texte,
+Popup-Listen, NOTE/DRUM-Segmente, Schalternamen) erscheinen wie bei mpc-vst-drumgen in
+Titillium Web SemiBold in der Größe der Reglernamen: `vst/captions.py` läuft in beiden
+`build.sh` direkt nach `gen_vst.py`. In `vst/layout.conf` tragen Rahmen, Popups und `enum_h`
+ihren Text deshalb in `caption="..."`. Schrift: `vst/fonts/` (SIL Open Font License, `OFL.txt`).
+
 ## Steuerung per MIDI-CC (beide Varianten)
 
 Das Plugin hat einen zweiten MIDI-Port „Control In" und verbindet ihn selbst mit allen

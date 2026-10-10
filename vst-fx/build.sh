@@ -19,12 +19,13 @@ else
     gcc -O2 -I/mv/tools/vendor/force-shadow/tools -o build/shadow_art /mv/tools/shadow_art.c -lm
 fi
 
-# 2. params.h (with PLUG_EFFECT), skin, pluginlist-entry.xml (needs Pillow)
+# 2. params.h (with PLUG_EFFECT), skin, pluginlist-entry.xml (needs Pillow); captions.py as in ../vst
 if python3 -c "import PIL" 2>/dev/null; then
   python3 "$MPC_VST/tools/gen_vst.py" vst.json
+  python3 ../vst/captions.py ../vst/layout.conf "build/skin/sd88me - VST - Euclidier FX/Plugin Skins" ../vst/fonts/TitilliumWeb-SemiBold.ttf
 else
   docker run --rm -u "$U" -v "$PWD/..":/w -v "$MPC_VST":/mv:ro -w /w/vst-fx python:3.11-slim sh -c \
-    "pip install -q --no-warn-script-location --target /tmp/p pillow >/dev/null 2>&1; PYTHONPATH=/tmp/p python3 /mv/tools/gen_vst.py vst.json"
+    "pip install -q --no-warn-script-location --target /tmp/p pillow >/dev/null 2>&1; PYTHONPATH=/tmp/p python3 /mv/tools/gen_vst.py vst.json && PYTHONPATH=/tmp/p python3 ../vst/captions.py ../vst/layout.conf \"build/skin/sd88me - VST - Euclidier FX/Plugin Skins\" ../vst/fonts/TitilliumWeb-SemiBold.ttf"
 fi
 grep -q "PLUG_EFFECT" build/params.h || { echo "params.h has no PLUG_EFFECT: this would build the instrument"; exit 1; }
 cp "$MPC_VST/wrapper/popup.h" build/
