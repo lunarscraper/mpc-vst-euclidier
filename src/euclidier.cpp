@@ -11,6 +11,7 @@
 #include "eqseq.h"
 #include <unistd.h>
 #include <sys/stat.h>
+#include <atomic>
 #include <chrono>
 #include <iostream>
 #include <sys/time.h>
@@ -48,6 +49,7 @@ bool velSense = true;
 bool receiveNotes = true;
 bool autosync = true;
 float BPM = 120.00;
+std::atomic<float> hostBPM{0.0f}; // MPC-VST: tempo the plugin wrapper read from the host (SET host_bpm <bpm*100>); 0 = estimate from the pulses
 int getOffset();
 float syncDiv = 3;
 bool doSync = false; // master-sync quantize (CC 50); off = edits apply immediately (safe: step position is stateless)
@@ -158,6 +160,7 @@ const unsigned char SEQS = 8;
 
 EQSEQ *SQ = new EQSEQ[8]; // creante the 8 track sequencer in an array
 string ctrlSockPath = "/tmp/euclidier_ctrl.sock";
+string midiClientName = "Euclidier"; // the ALSA client name of both MIDI ports (--client-name; one per plugin instance)
 void startCtrlSocket();
 int main(int argc, char *argv[])
 {
@@ -167,6 +170,10 @@ int main(int argc, char *argv[])
             bgprocess = true;
         else if (string(argv[a]) == "--ctrl-sock" && a + 1 < argc)
             ctrlSockPath = argv[++a];
+        else if (string(argv[a]) == "--client-name" && a + 1 < argc)
+            midiClientName = argv[++a];
+        else if (string(argv[a]) == "--clock-from" && a + 1 < argc) // only follow the clock sent by this ALSA client
+            rtmidi_clock_from = argv[++a];
     }
     // || string(argv[0]) == "/media/662522/AddOns/nodeServer/modules/euclidier";
 
@@ -178,11 +185,11 @@ int main(int argc, char *argv[])
     string tss = string(c, l > 0 ? l : 0);
     basePath = tss.length() > 0 ? tss.append(BANK) : "euclidier" + BANK;
     BOOT_TIME = now();
-    midiIn = new RtMidiIn();
+    midiIn = new RtMidiIn(RtMidi::UNSPECIFIED, midiClientName);
     midiIn->setCallback(&onMIDI);
     midiIn->ignoreTypes(false, false, false); // dont ignore clocK
 
-    midiOut = new RtMidiOut();
+    midiOut = new RtMidiOut(RtMidi::UNSPECIFIED, midiClientName);
     if (CONNECT_AKAI_NETWORK)
     {
         HWIN = new RtMidiIn();
@@ -903,8 +910,13 @@ void pulse() // used to compute bpm and send clock message to sequencer for sync
             avg += localavg;
             cnt++;
         }
-        float bpm = (avg / cnt);
-        BPM = bpm;
+        if (cnt > 0)
+            BPM = (float)(avg / cnt);
+        // The estimate above times pulses that arrive in a burst per audio block, in whole milliseconds: noisy. The plugin
+        // wrapper knows the real tempo; use it when it has told us (gate lengths and ratchets scale with BPM).
+        float hb = hostBPM.load();
+        if (hb >= 20.0f && hb <= 400.0f)
+            BPM = hb;
     }
 
     updateBPM(BPM);
@@ -948,7 +960,8 @@ void clockStop()
 
 unsigned long long now() // current time since epoch in ms
 {
-    return (unsigned long long)duration_cast<milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    // steady clock: the wall clock can be set (NTP) while playing, and a jump back would hold every note-off for that long
+    return (unsigned long long)duration_cast<milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
     return duration_cast<milliseconds>(high_resolution_clock::now().time_since_epoch()).count();
 }
 
@@ -958,7 +971,7 @@ unsigned long long ms() // ms elapsed since app started.
 }
 void updateBPM(float bpm) // sends the computed bpm to all sequencers
 {
-    if (isinf(bpm))
+    if (!std::isfinite(bpm) || bpm <= 0.0f)
         return;
 
     for (char i = 0; i < SEQS; i++)
@@ -979,7 +992,7 @@ void sendTicks() // send midi pulse to all sequencers
 
 long long getUS() // gets time since epch in microseconds
 {
-    auto t1 = std::chrono::system_clock::now();
+    auto t1 = std::chrono::steady_clock::now(); // not the wall clock: see now()
     long long us = duration_cast<microseconds>(t1.time_since_epoch()).count();
     return us;
 }
@@ -1581,6 +1594,7 @@ static string ctrlGet(const string &key)
 static bool ctrlSet(const string &key, int v)
 {
     if (key == "sel") { selLane = limit(v, 0, 7); return true; }
+    if (key == "host_bpm") { hostBPM.store(v / 100.0f); return true; }   // MPC-VST: tempo*100 from the host (0 = back to estimating)
     if (key == "preset") { ctrlMidi(20, limit(v, 0, 127)); return true; }
     if (key == "preset_load") { ctrlMidi(29, 127); return true; }
     if (key == "preset_save") { ctrlMidi(30, 127); return true; }

@@ -257,9 +257,11 @@ void EQSEQ::killHanging() // stops any playing note used before any operation th
 {
     if (this->__OFF > 0)
     {
-        if (this->mode <= 1)
+        // modes 1 (note) and 2 (drum) play notes, 3 and 4 CCs -- the same split as clock(). This said <= 1 / > 1, so a
+        // drum lane's note was "killed" with a CC and kept sounding after Stop (lunarscraper fork fix, 2026-11-06).
+        if (this->mode <= 2)
             this->sendNote(0x80, this->ch - 1, this->lastNote, 0); // kill hanging notes
-        if (this->mode > 1)
+        if (this->mode > 2)
             this->sendNote(0xB0, this->ch - 1, this->lastNote, this->vel); // kill hanging notes
 
         this->__OFF = 0;
@@ -290,6 +292,8 @@ int EQSEQ::getVel() // computes step velocity based on base velocity and humaniz
         int max = std::max(this->vel, this->velh);
         int min = std::min(this->vel, this->velh);
         int diff = (max - min);
+        if (diff == 0)
+            return min;
         int val = min + (rand() % diff);
         while (diff > 10 && std::abs(val - diff) < 5)
         {

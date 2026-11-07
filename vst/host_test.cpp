@@ -1,8 +1,11 @@
-/* Offline x86 test of euclidier_vst.cpp with the engine linked in-process (built
- * -DNO_ALSA by build.sh): parameter round-trip, popup, second instance stays inert,
- * synthesised transport -> notes, stop -> no hanging notes, chunk restore. PASSED/FAILED.
- * The effect variant (Euclidier FX, numInputs == 2) gets an input signal and must pass it
- * through bit-exact, separate buffers and in-place. */
+/* Offline x86 test of euclidier_vst.cpp with the engine linked in-process (built -DNO_ALSA by test.sh).
+ * The fork's checks (audio path of both variants, notes from a synthesised transport, no hanging notes after stop,
+ * a second instance stays silent, engine preset save/load, MIDI CC control on the Control Ch, chunk restore) plus
+ * upstream's design checks (fresh-instance drum defaults, step-display cells and play-head, lane stepper, randomise
+ * one lane / the selected lane / all, DRUM MODE ALL, no triggers in or replayed from a chunk). PASSED/FAILED.
+ * The effect variant (Euclidier FX, numInputs == 2) gets an input signal and must pass it through bit-exact,
+ * separate buffers and in-place. */
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -39,39 +42,48 @@ typedef struct {
 } VstTimeInfo;
 
 static VstTimeInfo ti;
-static intptr_t master(AEffect *, int32_t op, int32_t, intptr_t, void *, float) { return op == 7 ? (intptr_t)&ti : 0; }
+static std::map<int, int> automated;   /* audioMasterAutomate calls per param index */
+static intptr_t master(AEffect *, int32_t op, int32_t idx, intptr_t, void *, float) {
+    if (op == 0) automated[idx]++;
+    return op == 7 ? (intptr_t)&ti : 0;
+}
 static int fails = 0;
-#define CHECK(c, ...) do { if (!(c)) { fails++; std::printf("FAIL: " __VA_ARGS__); std::printf("\n"); } } while (0)
+#define CHECK(c, ...) do { if (!(c)) { fails++; std::printf("FAIL: " __VA_ARGS__); std::printf("\n"); } else { std::printf("ok:   " __VA_ARGS__); std::printf("\n"); } } while (0)
 
-static int find(AEffect *e, const char *key_name, int nth = 0) {   /* by display name, nth match */
+static int nparams(AEffect *e) { return e->numParams; }
+/* by key: effGetParamName gives names, so find keys through their (unique) names or name+nth */
+static int find(AEffect *e, const char *name, int nth = 0) {
     char buf[64];
-    for (int i = 0; i < e->numParams; i++) { e->dispatcher(e, 8, i, 0, buf, 0); if (!std::strcmp(buf, key_name) && nth-- == 0) return i; }
+    for (int i = 0; i < e->numParams; i++) { e->dispatcher(e, 8, i, 0, buf, 0); if (!std::strcmp(buf, name) && nth-- == 0) return i; }
     return -1;
 }
-static std::string disp(AEffect *e, int i) { char b[64] = {0}; e->dispatcher(e, 7, i, 0, b, 0); return b; }
+static std::string pname(AEffect *e, int i) { char b[64] = {0}; e->dispatcher(e, 8, i, 0, b, 0); return b; }
+static std::string disp(AEffect *e, int i) { char b[64] = {0}; if (i >= 0) e->dispatcher(e, 7, i, 0, b, 0); return b; }
+static void setv(AEffect *e, int i, int v, int lo, int hi) { e->setParameter(e, i, (float)(v - lo) / (hi - lo)); }
 
-/* real-time-ish run: the engine times note-offs by wall clock, so blocks are paced */
-static std::string play(AEffect *e, int blocks, bool stop_at_end = true) {
-    float l[128], r[128]; float *o[2] = {l, r};
-    float il[128], ir[128]; float *iv[2] = {il, ir};
-    for (int i = 0; i < 128; i++) { il[i] = 0.25f; ir[i] = -0.5f; }
-    float **in = e->numInputs ? iv : nullptr;
-    fflush(stdout);
+static float g_l[128], g_r[128], g_il[128], g_ir[128];
+static void blocks(AEffect *e, int n, bool playing, bool pace = true) {
+    float *o[2] = {g_l, g_r}, *iv[2] = {g_il, g_ir};
+    ti.flags = (playing ? (1 << 1) : 0) | (1 << 9) | (1 << 10); ti.tempo = 120;
+    for (int b = 0; b < n; b++) {
+        e->processReplacing(e, e->numInputs ? iv : nullptr, o, 128);
+        if (playing) ti.ppqPos += 128 * (120.0 / 60.0) / 44100.0;
+        if (pace) usleep(2902);
+    }
+}
+static void settle(AEffect *e, int ms = 150) { blocks(e, ms / 3 + 1, false); }   /* worker re-reads + host updates */
+
+/* real-time-ish run with the MIDI trace captured: the engine times note-offs by wall clock */
+static std::string play(AEffect *e, int n, bool stop_at_end = true) {
+    std::fflush(stdout);
     char *buf = nullptr; size_t len = 0;
     FILE *mem = open_memstream(&buf, &len);
     FILE *old = stdout; stdout = mem;
-    ti.flags = (1 << 1) | (1 << 9) | (1 << 10); ti.tempo = 120; ti.ppqPos = 0;
-    for (int b = 0; b < blocks; b++) {
-        e->processReplacing(e, in, o, 128);
-        ti.ppqPos += 128 * (120.0 / 60.0) / 44100.0;
-        usleep(2902);
-    }
-    if (stop_at_end) {
-        ti.flags = (1 << 9) | (1 << 10);
-        for (int b = 0; b < 40; b++) { e->processReplacing(e, in, o, 128); usleep(2902); }
-    }
-    fflush(mem); stdout = old; fclose(mem);
-    std::string s(buf, len); free(buf);
+    ti.ppqPos = 0;
+    blocks(e, n, true);
+    if (stop_at_end) blocks(e, 40, false);
+    std::fflush(mem); stdout = old; std::fclose(mem);
+    std::string s(buf, len); std::free(buf);
     return s;
 }
 static void balance(const std::string &s, int &ons, int &hanging) {
@@ -87,6 +99,14 @@ static void balance(const std::string &s, int &ons, int &hanging) {
     }
     for (auto &kv : held) if (kv.second > 0) hanging++;
 }
+static void send_cc(AEffect *a, int ch, int num, int val) {
+    VstMidiEvent m; std::memset(&m, 0, sizeof m);
+    m.type = 1; m.byteSize = sizeof m;
+    m.midiData[0] = (unsigned char)(0xB0 | (ch - 1)); m.midiData[1] = (unsigned char)num; m.midiData[2] = (unsigned char)val;
+    VstEvents ev; ev.numEvents = 1; ev.reserved = 0; ev.events[0] = &m; ev.events[1] = nullptr;
+    a->dispatcher(a, 25, 0, 0, &ev, 0);
+    blocks(a, 3, false);
+}
 
 int main(int argc, char **argv) {
     setenv("EUCLIDIER_TRACE", "1", 1);
@@ -94,9 +114,10 @@ int main(int argc, char **argv) {
     if (!h) { std::printf("dlopen: %s\nFAILED\n", dlerror()); return 1; }
     auto entry = (AEffect *(*)(audioMasterCallback))dlsym(h, "VSTPluginMain");
     AEffect *a = entry(master), *b = entry(master);
-    CHECK(a && b && a->magic == 0x56737450, "instances");
+    CHECK(a && b && a->magic == 0x56737450, "two instances load");
     std::printf("params: %d, inputs: %d, flags: 0x%x, category: %d\n", a->numParams, a->numInputs, a->flags,
                 (int)a->dispatcher(a, 35, 0, 0, nullptr, 0));
+    for (int i = 0; i < 128; i++) { g_il[i] = 0.25f; g_ir[i] = -0.5f; }
     {   /* audio path: instrument writes silence, effect passes the input through */
         float il[128], ir[128], ol[128], orr[128];
         for (int i = 0; i < 128; i++) { il[i] = i / 128.0f; ir[i] = -i / 256.0f; ol[i] = orr[i] = 9.0f; }
@@ -117,88 +138,191 @@ int main(int argc, char **argv) {
             CHECK(ol[5] == 0.0f && orr[5] == 0.0f, "instrument writes silence");
         }
     }
+    settle(a);
 
-    int en1 = find(a, "Enable", 0), steps1 = find(a, "Steps", 0), fill1 = find(a, "Fill", 0),
-        div1 = find(a, "Div", 0), divlist1 = find(a, "Div List", 0), en2 = find(a, "Enable", 1);
-    CHECK(en1 >= 0 && steps1 >= 0 && fill1 >= 0 && div1 >= 0 && divlist1 >= 0, "param lookup");
-    CHECK(disp(a, en1) == "ON", "lane 1 enabled by default: %s", disp(a, en1).c_str());
-    CHECK(disp(a, steps1) == "16", "lane 1 steps default %s", disp(a, steps1).c_str());
-    a->setParameter(a, fill1, (5 - 1) / 63.0f);
-    CHECK(disp(a, fill1) == "5", "fill set %s", disp(a, fill1).c_str());
-    a->setParameter(a, divlist1, 1.0f);
-    CHECK(a->getParameter(a, divlist1) > 0.5f, "popup opens");
-    a->setParameter(a, div1, 2.0f / 10.0f);    /* pick "1/8" exactly -> closes the popup */
-    CHECK(disp(a, div1) == "1/8" && a->getParameter(a, divlist1) < 0.5f, "div pick %s", disp(a, div1).c_str());
-    a->setParameter(a, div1, 0.0f);
-    a->setParameter(a, en2, 1.0f);
+    /* keys (names from make_skin.py / module.json) */
+    int en[9], st[9], fl[9], md[9], note[9];
+    for (int l = 1; l <= 8; l++) {
+        char k[16]; std::snprintf(k, sizeof k, "Lane %d", l);
+        en[l] = find(a, k);
+        st[l] = find(a, "Steps", l - 1); fl[l] = find(a, "Fill", l - 1); md[l] = find(a, "Mode", l - 1); note[l] = find(a, "Note", l - 1);
+    }
+    int sel = find(a, "Lane"), sel_next = find(a, "sel_next"), sel_steps = find(a, "Steps", 8), cch = find(a, "Control Ch");
+    int rnd_all = find(a, "Randomise All"), rnd_sel = find(a, "Randomise Lane"), rnd3 = find(a, "Randomise 3"), alld = find(a, "All Drum");
+    int save = find(a, "Save"), load = find(a, "Load"), preset = find(a, "Preset");
+    CHECK(en[1] >= 0 && en[8] >= 0 && st[8] >= 0 && fl[8] >= 0 && md[8] >= 0 && sel >= 0 && sel_next >= 0 && sel_steps >= 0 &&
+          cch >= 0 && rnd_all >= 0 && rnd_sel >= 0 && rnd3 >= 0 && alld >= 0 && save >= 0 && load >= 0 && preset >= 0, "param lookup");
+    CHECK(cch == nparams(a) - 1, "Control Ch is the last param (upstream indices unchanged)");
 
-    std::string s = play(a, 700);   /* ~2 s = 1 bar at 120 BPM */
-    int ons, hanging;
-    balance(s, ons, hanging);
-    std::printf("instance A: %d note-ons in ~1 bar, %d hanging after stop\n", ons, hanging);
-    CHECK(ons >= 5 && ons <= 40, "note count %d", ons);
-    CHECK(hanging == 0, "hanging notes %d", hanging);
-    std::string sb = play(b, 100);
-    CHECK(sb.find("MIDI 9") == std::string::npos, "second instance silent");
-
-    int rnd = find(a, "Randomize"), save = find(a, "Save"), load = find(a, "Load");
-    CHECK(rnd >= 0 && save >= 0 && load >= 0, "preset/randomize params");
-    a->setParameter(a, save, 1.0f);            /* store the current state in slot 1 */
-    a->setParameter(a, rnd, 1.0f);             /* randomize, then load slot 1 back */
-    play(a, 60);
-    a->setParameter(a, load, 1.0f);
-    play(a, 60);
-    CHECK(disp(a, fill1) == "5", "preset load restores fill: %s", disp(a, fill1).c_str());
-
-    {   /* control by MIDI CC: lane 1 fill = CC 12, on the Control Ch (default 16) only */
-        int cch = find(a, "Control Ch");
-        CHECK(cch >= 0 && disp(a, cch) == "16", "control channel default 16: %s", cch >= 0 ? disp(a, cch).c_str() : "missing");
-        auto cc = [&](int ch, int num, int val) {
-            VstMidiEvent m; std::memset(&m, 0, sizeof m);
-            m.type = 1; m.byteSize = sizeof m;
-            m.midiData[0] = (unsigned char)(0xB0 | (ch - 1)); m.midiData[1] = (unsigned char)num; m.midiData[2] = (unsigned char)val;
-            VstEvents ev; ev.numEvents = 1; ev.reserved = 0; ev.events[0] = &m; ev.events[1] = nullptr;
-            a->dispatcher(a, 25, 0, 0, &ev, 0);
-            float l[128], r[128], il[128] = {0}, ir[128] = {0}; float *o[2] = {l, r}, *iv[2] = {il, ir};
-            ti.flags = (1 << 9) | (1 << 10);
-            for (int b = 0; b < 3; b++) a->processReplacing(a, a->numInputs ? iv : nullptr, o, 128);
-        };
-        cc(16, 12, 64);
-        CHECK(disp(a, fill1) == "33", "CC 12 on ch 16 sets lane 1 fill: %s", disp(a, fill1).c_str());
-        cc(1, 12, 0);
-        CHECK(disp(a, fill1) == "33", "CC on another channel is ignored: %s", disp(a, fill1).c_str());
-        cc(16, 11, 127);
-        CHECK(disp(a, steps1) == "64", "CC 11 sets lane 1 steps: %s", disp(a, steps1).c_str());
-        cc(16, 20, 0);
-        CHECK(disp(a, en2) == "OFF", "CC 20 switches lane 2 off: %s", disp(a, en2).c_str());
-        a->setParameter(a, cch, 3.0f / 16.0f);
-        CHECK(disp(a, cch) == "3", "control channel 3: %s", disp(a, cch).c_str());
-        cc(16, 12, 0);
-        CHECK(disp(a, fill1) == "33", "old channel ignored after change: %s", disp(a, fill1).c_str());
-        cc(3, 12, 0);
-        CHECK(disp(a, fill1) == "1", "new channel works: %s", disp(a, fill1).c_str());
-        a->setParameter(a, cch, 0.0f);
-        cc(3, 12, 127); cc(1, 12, 127);
-        CHECK(disp(a, cch) == "OFF" && disp(a, fill1) == "1", "OFF ignores every CC: %s", disp(a, fill1).c_str());
-        a->setParameter(a, cch, 3.0f / 16.0f);
-        a->setParameter(a, fill1, (5 - 1) / 63.0f);
-        a->setParameter(a, steps1, (16 - 2) / 62.0f);
+    /* fresh-instance defaults (upstream's): lanes 1-4 on with their own patterns, 5-8 off, all DRUM */
+    {
+        int bad = 0;
+        for (int l = 1; l <= 8; l++) { if ((disp(a, en[l]) == "ON") != (l <= 4)) bad++; if (disp(a, md[l]) != "DRUM") bad++; }
+        CHECK(!bad && disp(a, st[1]) == "16" && disp(a, fl[1]) == "4" && disp(a, st[2]) == "8" && disp(a, fl[2]) == "3" &&
+              disp(a, st[3]) == "12", "fresh defaults: lanes 1-4 on (16/4, 8/3, 12/5, 16/5), 5-8 off, all DRUM");
+        CHECK(disp(a, note[1]) == "36" && disp(a, note[2]) == "37", "drum lanes on their GM notes: %s %s", disp(a, note[1]).c_str(), disp(a, note[2]).c_str());
     }
 
-    void *ck = nullptr;
-    intptr_t n = a->dispatcher(a, 23, 0, 0, &ck, 0);
-    CHECK(n > 100 && ck && std::strstr((char *)ck, "l1_fill=5;"), "chunk contains fill");
-    CHECK(ck && std::strstr((char *)ck, "cc_ch=3;"), "chunk contains the control channel");
-    int cch2 = find(a, "Control Ch");
-    std::string chunk((char *)ck, n);
-    a->setParameter(a, fill1, 1.0f);
-    a->setParameter(a, cch2, 1.0f);
-    a->dispatcher(a, 24, 0, n, (void *)chunk.data(), 0);
-    CHECK(disp(a, fill1) == "5", "chunk restore fill %s", disp(a, fill1).c_str());
-    CHECK(disp(a, cch2) == "3", "chunk restore control channel %s", disp(a, cch2).c_str());
+    /* notes from a synthesised transport, none left hanging after stop */
+    {
+        std::string s = play(a, 700);   /* ~2 s = 1 bar at 120 BPM */
+        int ons, hanging;
+        balance(s, ons, hanging);
+        std::printf("instance A: %d note-ons in ~1 bar, %d hanging after stop\n", ons, hanging);
+        CHECK(ons >= 10 && ons <= 40, "note count %d (lanes 1-4: 4+6+5+5 hits per bar)", ons);
+        CHECK(hanging == 0, "no hanging notes (%d)", hanging);
+        std::string sb = play(b, 100);
+        CHECK(sb.find("MIDI 9") == std::string::npos, "second instance silent");
+    }
+
+    /* step displays: lane 1 at 12 steps -> the 16-slot class shows 12 cells, the others stay hidden, the play-head moves */
+    {
+        int i16[32], n16 = 0, wrong = 0;
+        for (int s2 = 0; s2 < 16; s2++) { char k[24]; std::snprintf(k, sizeof k, "G1.16.%d", s2); i16[n16++] = find(a, k); }
+        setv(a, st[1], 12, 2, 32);
+        settle(a);
+        int moved = 0, last = -1;
+        ti.ppqPos = 0;
+        for (int k = 0; k < 120; k++) {
+            blocks(a, 8, true, false);
+            usleep(10000);
+            for (int j = 0; j < n16; j++)   /* the cell showing the play-head: option 3 or 4 of 5 */
+                if (a->getParameter(a, i16[j]) > 0.7f && j != last) { last = j; moved++; }
+        }
+        blocks(a, 5, false);
+        int shown = 0;
+        for (int j = 0; j < n16; j++) if (a->getParameter(a, i16[j]) > 0.0f) shown++;
+        for (int i = 0; i < a->numParams; i++) {
+            std::string n = pname(a, i); int c, s2;
+            if (std::sscanf(n.c_str(), "G1.%d.%d", &c, &s2) == 2 && c != 16 && a->getParameter(a, i) > 0.0f) wrong++;
+        }
+        CHECK(shown == 12 && !wrong, "lane 1 at 12 steps: %d cells of the 16-slot class shown, %d of other classes", shown, wrong);
+        CHECK(moved > 3, "play-head cell moved %d times", moved);
+        int pushed = 0; for (int j = 0; j < n16; j++) pushed += automated[i16[j]];
+        CHECK(pushed > 0, "cell changes are reported to the host (%d)", pushed);
+        int c12 = 0;
+        for (int i = 0; i < a->numParams; i++) { int c, s2; if (std::sscanf(pname(a, i).c_str(), "C%d.%d", &c, &s2) == 2 && c == 12 && a->getParameter(a, i) > 0.0f) c12++; }
+        CHECK(c12 == 12, "circle (selected lane 1) shows the 12-dot class: %d", c12);
+        setv(a, st[1], 16, 2, 32);
+    }
+
+    /* lane stepper and the sel_* copies */
+    {
+        a->setParameter(a, sel_next, 1.0f);
+        settle(a);
+        CHECK(disp(a, sel) == "LANE 2" && disp(a, sel_steps) == "8", "sel_next -> %s, its steps %s (expect LANE 2, 8)", disp(a, sel).c_str(), disp(a, sel_steps).c_str());
+        setv(a, sel_steps, 10, 2, 32);
+        settle(a);
+        CHECK(disp(a, st[2]) == "10", "sel_steps writes lane 2: %s", disp(a, st[2]).c_str());
+    }
+
+    /* randomise: one lane, the selected lane, all (compare patterns before/after) */
+    {
+        auto snap = [&](int l) { return disp(a, st[l]) + "/" + disp(a, fl[l]) + "/" + disp(a, find(a, "Shift", l - 1)); };
+        bool changed3 = false, others = false;
+        for (int t = 0; t < 6 && !changed3; t++) {   /* a random draw can repeat a value: try a few times */
+            std::string b1 = snap(1), b3 = snap(3);
+            a->setParameter(a, rnd3, 1.0f); settle(a, 250);
+            changed3 = snap(3) != b3; others |= snap(1) != b1;
+        }
+        CHECK(changed3 && !others, "RANDOMISE lane 3 changes lane 3 only");
+        bool changed2 = false; others = false;
+        for (int t = 0; t < 6 && !changed2; t++) {
+            std::string b1 = snap(1), b2 = snap(2);
+            a->setParameter(a, rnd_sel, 1.0f); settle(a, 250);
+            changed2 = snap(2) != b2; others |= snap(1) != b1;
+        }
+        CHECK(changed2 && !others, "RANDOMISE (selected lane 2) changes lane 2 only");
+        int changed = 0;
+        std::string bs[9]; for (int l = 1; l <= 8; l++) bs[l] = snap(l);
+        a->setParameter(a, rnd_all, 1.0f); settle(a, 250);
+        for (int l = 1; l <= 8; l++) changed += snap(l) != bs[l];
+        CHECK(changed >= 5, "RANDOMISE ALL changes most lanes (%d of 8)", changed);
+    }
+
+    /* DRUM MODE ALL */
+    {
+        for (int l = 1; l <= 8; l++) a->setParameter(a, md[l], 0.0f);
+        settle(a);
+        int notes = 0; for (int l = 1; l <= 8; l++) notes += disp(a, md[l]) == "NOTE";
+        a->setParameter(a, alld, 1.0f); settle(a);
+        int drums = 0; for (int l = 1; l <= 8; l++) drums += disp(a, md[l]) == "DRUM";
+        CHECK(notes == 8 && drums == 8, "DRUM MODE ALL: %d NOTE before, %d DRUM after", notes, drums);
+    }
+
+    /* engine preset bank: save, randomise, load back */
+    {
+        setv(a, fl[1], 5, 1, 32); setv(a, st[1], 16, 2, 32);
+        settle(a);
+        a->setParameter(a, save, 1.0f); settle(a, 200);
+        a->setParameter(a, rnd_all, 1.0f); settle(a, 250);
+        a->setParameter(a, load, 1.0f); settle(a, 250);
+        CHECK(disp(a, fl[1]) == "5" && disp(a, st[1]) == "16", "preset load restores lane 1 (fill %s, steps %s)", disp(a, fl[1]).c_str(), disp(a, st[1]).c_str());
+    }
+
+    /* control by MIDI CC: lane 1 fill = CC 12, on the Control Ch (default 16) only */
+    {
+        CHECK(disp(a, cch) == "16", "control channel default 16: %s", disp(a, cch).c_str());
+        send_cc(a, 16, 12, 64); settle(a);
+        std::string f = disp(a, fl[1]);
+        CHECK(f == "17", "CC 12 on ch 16 sets lane 1 fill: %s", f.c_str());
+        send_cc(a, 1, 12, 0); settle(a);
+        CHECK(disp(a, fl[1]) == f, "CC on another channel is ignored: %s", disp(a, fl[1]).c_str());
+        send_cc(a, 16, 11, 127); settle(a);
+        CHECK(disp(a, st[1]) == "32", "CC 11 sets lane 1 steps: %s", disp(a, st[1]).c_str());
+        send_cc(a, 16, 20, 127); settle(a);
+        CHECK(disp(a, en[2]) == "ON", "CC 20 switches lane 2 on: %s", disp(a, en[2]).c_str());
+        a->setParameter(a, cch, 3.0f / 16.0f);
+        CHECK(disp(a, cch) == "3", "control channel 3: %s", disp(a, cch).c_str());
+        send_cc(a, 16, 12, 0); settle(a);
+        CHECK(disp(a, fl[1]) == f, "old channel ignored after change: %s", disp(a, fl[1]).c_str());
+        send_cc(a, 3, 12, 0); settle(a);
+        CHECK(disp(a, fl[1]) == "1", "new channel works: %s", disp(a, fl[1]).c_str());
+        a->setParameter(a, cch, 0.0f);
+        send_cc(a, 3, 12, 127); send_cc(a, 1, 12, 127); settle(a);
+        CHECK(disp(a, cch) == "OFF" && disp(a, fl[1]) == "1", "OFF ignores every CC: %s", disp(a, fl[1]).c_str());
+        a->setParameter(a, cch, 3.0f / 16.0f);
+        std::string b4 = disp(a, st[4]) + disp(a, fl[4]), b1 = disp(a, st[1]) + disp(a, fl[1]);
+        send_cc(a, 3, 103, 51); settle(a);   /* Rand Lane -> option 4 of 0..10 = LANE 4 */
+        bool ch4 = false;
+        for (int t = 0; t < 6 && !ch4; t++) { send_cc(a, 3, 104, 127); settle(a, 250); ch4 = disp(a, st[4]) + disp(a, fl[4]) != b4; }
+        CHECK(ch4 && disp(a, st[1]) + disp(a, fl[1]) == b1, "CC 103 LANE 4 + CC 104 randomises lane 4 only");
+        setv(a, fl[1], 5, 1, 32); setv(a, st[1], 16, 2, 32);
+        settle(a);
+    }
+
+    /* project chunk: values in, triggers and sel_* mirrors out; restore into the same and a fresh state */
+    {
+        void *ck = nullptr;
+        intptr_t n = a->dispatcher(a, 23, 0, 0, &ck, 0);
+        std::string chunk((char *)ck, n);
+        CHECK(n > 100 && chunk.find("l1_fill=5;") != std::string::npos && chunk.find("cc_ch=3;") != std::string::npos, "chunk holds fill and the control channel");
+        CHECK(chunk.find("rand_go") == std::string::npos && chunk.find("preset_load") == std::string::npos &&
+              chunk.find("preset_save") == std::string::npos && chunk.find("sel_") == std::string::npos && chunk.find("G1.") == std::string::npos &&
+              chunk.find("g1_") == std::string::npos, "chunk holds no triggers, sel_* mirrors or display cells");
+        std::string before[700]; int np = a->numParams;
+        for (int i = 0; i < np && i < 700; i++) before[i] = disp(a, i);
+        a->setParameter(a, fl[1], 1.0f); a->setParameter(a, cch, 1.0f); a->setParameter(a, md[3], 0.0f);
+        setv(a, note[3], 77, 0, 127);
+        settle(a);
+        std::string old = chunk.substr(0, chunk.size() - 1) + "rand_go=0;preset_load=0;preset_save=0;";   /* what older versions saved */
+        a->dispatcher(a, 24, 0, (intptr_t)old.size() + 1, (void *)old.c_str(), 0);
+        settle(a, 250);
+        int bad = 0;
+        for (int i = 0; i < np && i < 700; i++) {
+            std::string nm = pname(a, i);
+            if ((nm[0] == 'G' || nm[0] == 'C') && nm.find('.') != std::string::npos) continue;   /* display cells */
+            if (disp(a, i) != before[i]) { std::printf("  restore differs: %s '%s' -> '%s'\n", nm.c_str(), before[i].c_str(), disp(a, i).c_str()); bad++; }
+        }
+        CHECK(bad == 0, "chunk restore brings every value back (%d differ; triggers in it not replayed)", bad);
+    }
 
     b->dispatcher(b, 1, 0, 0, nullptr, 0);
     a->dispatcher(a, 1, 0, 0, nullptr, 0);
+    AEffect *c = entry(master);   /* after the owner closed, a new instance drives the engine again */
+    std::string sc = play(c, 400);
+    CHECK(sc.find("MIDI 9") != std::string::npos, "a new instance after closing the owner plays");
+    c->dispatcher(c, 1, 0, 0, nullptr, 0);
     std::printf(fails ? "FAILED\n" : "PASSED\n");
     return fails ? 1 : 0;
 }

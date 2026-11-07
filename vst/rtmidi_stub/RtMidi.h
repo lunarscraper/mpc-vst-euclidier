@@ -13,6 +13,9 @@
 #include <vector>
 
 extern void (*g_euclidier_send)(const std::vector<unsigned char> &msg);
+/* The real RtMidi.h declares this (euclidier --clock-from: follow only that ALSA client's clock). In-process the plugin
+ * hands the engine its clock directly, so it is never read; it only has to exist for main()'s option parsing. */
+inline std::string rtmidi_clock_from;
 
 class RtMidi {
 public:

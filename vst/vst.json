@@ -2,9 +2,10 @@
   "name": "Euclidier",
   "vendor": "sd88me",
   "uid": "EqDr",
-  "version": 1000,
+  "version": 1200,
   "so": "euclidier.so",
-  "module": "module.json",
   "layout": "layout.conf",
-  "_comment": "MIDI generator with host-side glue (docs/PORTING.md classification 0): vst.json/module.json only feed tools/gen_vst.py for params.h + the skin. The plugin is euclidier_vst.cpp, built by this port's own build.sh: the vendored engine (../src, unmodified) is compiled in-process against rtmidi_stub/RtMidi.h, and notes go out through the plugin's own ALSA seq port 'Euclidier' -- no child process, no AddOns path."
+  "params": "params.json",
+  "art": "html",
+  "_comment": "MIDI generator with host-side glue (docs/PORTING.md classification 0): vst.json/params.json only feed tools/gen_vst.py for params.h + the skin (params.json, layout.conf and images/ come from make_skin.py, upstream's design). The plugin is euclidier_vst.cpp, built by this port's own build.sh: the engine (../src) is compiled in-process against rtmidi_stub/RtMidi.h, and notes go out through the plugin's own ALSA seq port 'Euclidier' -- no child process, no engine binary to ship."
 }
