@@ -1,15 +1,16 @@
 # Build Euclidier into a DRAFT release (euclidier-vst-v<version>) with mpc-vst-plugins' shared workflow:
 # Actions -> "VST release (draft)" -> Run workflow. dry_run (default on) builds the zip and skin
-# previews as run artifacts only. tools_ref pinned to the same mpc-vst-plugins commit as mpc-vst-acid.
+# previews as run artifacts only. mpc-vst-plugins now lives at open-mpc/mpc-vst-plugins (moved from sd88me):
+# pinned to one commit in BOTH places (uses:@ and tools_ref), as its vst-release.yml asks.
 name: VST release (draft)
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: Version, e.g. 1.1.0
+        description: Version, e.g. 1.2.0
         required: true
-        default: 1.1.0
+        default: 1.2.0
       dry_run:
         description: Build only (zip + skin previews as run artifacts), no draft release
         type: boolean
@@ -17,13 +18,13 @@ on:
 
 jobs:
   euclidier:
-    uses: sd88me/mpc-vst-plugins/.github/workflows/vst-release.yml@259f75d0ce0f836cfd89cc0a33c550b55917cffc
+    uses: open-mpc/mpc-vst-plugins/.github/workflows/vst-release.yml@db0ca3fa7593bddbd604c9e59c373964dc6be6ff
     permissions:
       contents: write
     with:
       tag: euclidier-vst-v${{ inputs.version }}
       version: ${{ inputs.version }}
-      tools_ref: 259f75d0ce0f836cfd89cc0a33c550b55917cffc
+      tools_ref: db0ca3fa7593bddbd604c9e59c373964dc6be6ff
       vst_dir: vst
       build: bash vst/build.sh
       host_test: bash vst/test.sh
