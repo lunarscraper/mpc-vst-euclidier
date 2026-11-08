@@ -2,7 +2,7 @@
   "name": "Euclidier",
   "vendor": "sd88me",
   "uid": "EqDr",
-  "version": 1200,
+  "version": 1201,
   "so": "euclidier.so",
   "layout": "layout.conf",
   "params": "params.json",

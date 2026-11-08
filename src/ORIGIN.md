@@ -18,3 +18,7 @@ Changes on top of upstream's copy (sd88me/mpc-vst-euclidier, 2026-10-14):
   last note kept sounding after Stop (found by the host test, 2026-11-06, offline).
 
 Licence: see the note in the top-level `README.md`.
+- `euclidier.cpp` global `sendNote()`: new switch `feedbackOut` (default on; the plugin turns it off). That function
+  only sends controller feedback (the lane values as CCs on channel 16 after a preset load, a randomise or an edit).
+  In-process it went out of the plugin's MIDI port into the driven instrument, which took the CCs as sound changes:
+  on the Force the level dropped with every RANDOMISE ALL in Euclidier FX (user report 2026-11-08, device).

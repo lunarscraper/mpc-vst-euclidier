@@ -2,7 +2,7 @@
   "name": "Euclidier FX",
   "vendor": "sd88me",
   "uid": "EqFx",
-  "version": 1200,
+  "version": 1201,
   "so": "euclidier_fx.so",
   "effect": true,
   "layout": "../vst/layout.conf",

@@ -167,7 +167,7 @@ static inline bool ppq_clock_block(PpqClock *c, double ppq, double tempo, double
     return true;
 }
 
-#define BUILD_ID "design-2026-11-06"
+#define BUILD_ID "nofeedback-2026-11-08"
 #ifdef PLUG_EFFECT
 #define PLUG_MODE "effect"
 #else
@@ -324,6 +324,7 @@ static void engine_init() {   /* caller holds engineMutex; runs once per process
     if (done) return;
     done = true;
     bgprocess = true;                              /* no console output inside MPC */
+    feedbackOut = false;                           /* no CC feedback on ch 16 into the driven tracks (see euclidier.cpp) */
     srand(time(NULL));
     basePath = plugin_dir() + "/euclidier_" + BANK;   /* the bank next to the .so */
     BOOT_TIME = now();

@@ -778,8 +778,16 @@ void handleMidi(std::vector<unsigned char> *message) // shared by the MIDI callb
     }
 }
 
+// Every call of this global sendNote() is controller FEEDBACK (CC on channel 16: the lane values after a preset load,
+// a randomise, an edit), meant for the standalone's GUI/controller. Inside the plugin (lunarscraper fork) the engine's
+// output port is the port the driven tracks listen to, so that feedback landed in the instruments as CCs and changed
+// their sound (level dropping with every RANDOMISE). euclidier_vst.cpp sets this false; the lanes' notes and CCs go
+// through EQSEQ::sendNote and are not affected.
+bool feedbackOut = true;
 void sendNote(unsigned char type, unsigned char ch, unsigned char note, unsigned char vel)
 {
+    if (!feedbackOut)
+        return;
     std::vector<unsigned char> messageOut;
     messageOut.push_back(ch + type);
     messageOut.push_back(note);

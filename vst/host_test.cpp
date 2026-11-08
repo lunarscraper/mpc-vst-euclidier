@@ -238,6 +238,18 @@ int main(int argc, char **argv) {
         a->setParameter(a, rnd_all, 1.0f); settle(a, 250);
         for (int l = 1; l <= 8; l++) changed += snap(l) != bs[l];
         CHECK(changed >= 5, "RANDOMISE ALL changes most lanes (%d of 8)", changed);
+        /* the engine's controller feedback (CCs on ch 16) must not reach the MIDI out: the driven instrument took it
+         * as sound changes (level dropping with every RANDOMISE, Force 2026-11-08) */
+        std::fflush(stdout);
+        char *buf = nullptr; size_t len = 0;
+        FILE *mem = open_memstream(&buf, &len), *old = stdout; stdout = mem;
+        for (int t = 0; t < 3; t++) { a->setParameter(a, rnd_all, 1.0f); settle(a, 250); }
+        a->setParameter(a, save, 1.0f); settle(a, 200);
+        a->setParameter(a, load, 1.0f); settle(a, 250);
+        std::fflush(mem); stdout = old; std::fclose(mem);
+        std::string out(buf, len); std::free(buf);
+        int ccs = 0; for (size_t p = 0; (p = out.find("MIDI bf", p)) != std::string::npos; p++) ccs++;
+        CHECK(ccs == 0, "randomise / preset load send no CC feedback on ch 16 (%d)", ccs);
     }
 
     /* DRUM MODE ALL */
