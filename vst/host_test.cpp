@@ -163,6 +163,40 @@ int main(int argc, char **argv) {
         CHECK(disp(a, note[1]) == "36" && disp(a, note[2]) == "37", "drum lanes on their GM notes: %s %s", disp(a, note[1]).c_str(), disp(a, note[2]).c_str());
     }
 
+    /* NOTE by data wheel (2026-11-09, Force: notes 2, 7, 12, 16 ... 40, 45 couldn't be set). A wheel click is 0.01 of
+     * the range = 1.27 notes; MPC adds it to the value it holds itself (re-reading or not): every click must move
+     * exactly one note, up and down, from any start. A Q-Link event (1/128) too. A large jump still sets outright. */
+    {
+        const float steps[3] = {0.01f, -0.01f, 1.0f / 128};
+        const char *nm[3] = {"wheel up", "wheel down", "Q-Link up"};
+        for (int reread = 0; reread < 2; reread++)
+            for (int t = 0; t < 3; t++) {
+                int bad = 0, first_bad = -1;
+                for (int start = 30; start <= 34; start++) {
+                    setv(a, note[4], start, 0, 127);
+                    a->setParameter(a, note[4], 0.9f);              /* away and back: a fresh gesture */
+                    setv(a, note[4], start, 0, 127);
+                    float x = (float)start / 127;
+                    int prev = start;
+                    for (int k = 0; k < 20; k++) {
+                        if (reread) x = a->getParameter(a, note[4]);
+                        x += steps[t];
+                        a->setParameter(a, note[4], x);
+                        int now = std::atoi(disp(a, note[4]).c_str());
+                        if (now != prev + (steps[t] > 0 ? 1 : -1)) { bad++; if (first_bad < 0) first_bad = now; }
+                        prev = now;
+                    }
+                }
+                CHECK(bad == 0, "lane 4 NOTE, %s (%s): one note per event (%d off, first at %d)", nm[t],
+                      reread ? "host re-reads" : "host keeps its own value", bad, first_bad);
+            }
+        setv(a, note[4], 10, 0, 127);
+        setv(a, note[4], 100, 0, 127);
+        CHECK(disp(a, note[4]) == "100", "a large jump sets NOTE outright: %s", disp(a, note[4]).c_str());
+        setv(a, note[4], 39, 0, 127);
+        CHECK(disp(a, note[4]) == "39", "lane 4 NOTE back to 39: %s", disp(a, note[4]).c_str());
+    }
+
     /* notes from a synthesised transport, none left hanging after stop */
     {
         std::string s = play(a, 700);   /* ~2 s = 1 bar at 120 BPM */

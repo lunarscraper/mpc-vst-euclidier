@@ -186,6 +186,7 @@ struct Plugin {
     bool owner = false;                    /* this instance drives the (global) engine */
     std::atomic<float> cache[NPARAMS];     /* what the host sees */
     std::atomic<float> told[NPARAMS];      /* what the host last heard (-1: nothing yet); a differing cache is pushed */
+    float host_raw[NPARAMS];               /* the last value the host sent (-1: none yet): long ranges step from it */
     volatile int release[NPARAMS] = {0};   /* momentary triggers / popups to report back */
     float open[NPARAMS] = {0};             /* popup "open" flags (popup.h): wrapper-only */
     float sr = 44100.0f;
@@ -745,6 +746,23 @@ static void setParameter(AEffect *e, int32_t i, float n) {
             nudge = true;
         }
     }
+    /* A whole-number range of more than 100 (NOTE, VELOCITY, PRESET: 0-127): a data-wheel click is 0.01 of the range =
+     * 1.27 values, and MPC adds it to the value it holds itself, so rounding each set skipped every fourth value (NOTE
+     * 2, 7, 12, 16 ... 40, 45 couldn't be set, Force, 2026-11-09). A move of 0.5 to 4 values from what the host sent
+     * last steps from the engine's value instead: one per event (Q-Link 0.99, wheel 1.27), round(move) for a fast spin
+     * (2+). A bigger move (a drag, automation) and anything on a short range set the value outright, as before. */
+    if (!p->nopts && p->max - p->min > 100) {
+        const float span = p->max - p->min, prev = w->host_raw[i];
+        w->host_raw[i] = clamp01(raw);
+        if (prev >= 0.0f) {
+            const float d = (clamp01(raw) - prev) * span, ad = std::fabs(d);
+            if (ad >= 0.5f && ad <= 4.0f) {
+                const int k = ad < 2.0f ? 1 : (int)std::lround(ad);
+                const int v = std::min((int)p->max, std::max((int)p->min, value_of(w, i) + (d > 0 ? k : -k)));
+                n = ui_to_norm(p, v);
+            }
+        }
+    }
     w->told[i].store(raw);
     set_value(w, i, norm_to_ui(p, n));
     processQ();
@@ -886,7 +904,7 @@ extern "C" __attribute__((visibility("default"))) AEffect *VSTPluginMain(audioMa
     std::call_once(once, build_vtable);
     Plugin *w = new Plugin();
     w->master = master;
-    for (int i = 0; i < NPARAMS; i++) { w->cache[i].store(PARAMS[i].def); w->told[i].store(-1.0f); }
+    for (int i = 0; i < NPARAMS; i++) { w->cache[i].store(PARAMS[i].def); w->told[i].store(-1.0f); w->host_raw[i] = -1.0f; }
     if (g_cc_ch_idx >= 0) w->cache[g_cc_ch_idx].store(1.0f);   /* default: channel 16 */
     {
         std::lock_guard<std::mutex> lk(engineMutex);
